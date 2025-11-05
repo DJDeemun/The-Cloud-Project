@@ -1,0 +1,1629 @@
+// CloudChat — single-file Cloudflare Worker (Modules syntax)
+// Discord-style chat with Global + DMs + Group Chats (create/join/leave),
+// Reactions, Edit/Delete, Replies, Pins, Presence, Typing, Markdown,
+// Link Previews, Image Attachments, Unread badges, Auto-open DMs,
+// Clear DM (per-thread), Clear Group (owner-only), Clear Global (token-gated), Favicon.
+//
+// ---------------------------------------------------------------------------------
+// Bindings:
+//   KV Namespace:  binding = "CLOUDCHAT"
+// Optional Vars:
+//   CLEAR_TOKEN         (require this token to clear GLOBAL; also grants group clear)
+//   EDIT_WINDOW_SECONDS (default: 300)
+//   MAX_MSGS_PER_INDEX  (default: 1000)
+//   MAX_ATTACHMENT_KB   (default: 400)   // ~0.4 MB per image
+// ---------------------------------------------------------------------------------
+//
+// Routes:
+//   GET  /                                   → SPA
+//   GET  /robots.txt
+//   GET  /favicon.svg  (/favicon.ico -> svg)
+//
+//   GET  /api/history?channel=global|dm:<a>:<b>|grp:<id>&since=TS&limit=100
+//   GET  /api/stream                          (SSE events: message/typing/reaction/edit/delete/pin/cleared-channel)
+//   GET  /api/dmlist?user=<uid>               → DM peers
+//   POST /api/message                         → { userId, content, channel?, replyTo?, attachments?[] }
+//   POST /api/profile                         → { userId, username, avatarData? }
+//   GET  /api/profile/:id
+//   GET  /api/avatar/:id
+//   POST /api/typing                          → { userId, channel }
+//   POST /api/react                           → { userId, channel, id, emoji, op:'add'|'remove' }
+//   GET  /api/reactions?channel=...&ids=a,b   → { id: {emoji: count, ...}, ... }
+//   POST /api/edit-message                    → { userId, channel, id, content }
+//   POST /api/delete-message                  → { userId, channel, id }  (CLEAR_TOKEN acts as mod)
+//   GET  /api/pins?channel=...                → [messageIds]
+//   POST /api/pin                             → { userId, channel, id, op:'add'|'remove' } (author or admin token)
+//   POST /api/clear                           → Clear GLOBAL only (token-gated if CLEAR_TOKEN set)
+//   POST /api/clear-channel                   → Clear specific DM { userId, channel } (participants only)
+//   POST /api/ping                            → presence heartbeat { userId } (TTL ~180s)
+//   GET  /api/presence?ids=a,b,c              → { id: true/false, ... }
+//   POST /api/upload                          → { userId, dataUrl } returns { ok, id, url }
+//   GET  /api/attach/:id
+//   GET  /api/og?u=<url>                      → { title, description, image }
+//
+//   // Group APIs
+//   GET  /api/grouplist?user=<uid>            → [{ id, name, ownerId, memberCount }]
+//   GET  /api/group/info?groupId=<id>         → { ok, group }
+//   GET  /api/group/members?groupId=<id>      → [{ userId, username, version }]
+//   POST /api/group/create                    → { userId, name }
+//   POST /api/group/join                      → { userId, groupId }
+//   POST /api/group/leave                     → { userId, groupId }
+//   POST /api/clear-group                     → { userId, groupId } (owner or CLEAR_TOKEN)
+// ---------------------------------------------------------------------------------
+
+export default {
+  async fetch(request, env) {
+    try {
+      const url = new URL(request.url);
+      const { pathname, searchParams } = url;
+      const path = normalizePath(pathname);
+
+      if (request.method !== "GET" && request.method !== "POST") {
+        return text("Method Not Allowed", 405);
+      }
+
+      // ---------- Static ----------
+      if (path === "/" || path === "/index.html") {
+        return withHeaders(viewHTML(), {
+          "content-type": "text/html; charset=UTF-8",
+          "x-content-type-options": "nosniff",
+          "referrer-policy": "no-referrer",
+          "cache-control": "no-store"
+        });
+      }
+      if (path === "/robots.txt") {
+        return withHeaders("User-agent: *\nDisallow:", { "content-type": "text/plain; charset=UTF-8" });
+      }
+      if (path === "/favicon.svg" || path === "/favicon.ico") {
+        return withHeaders(faviconSVG(), { "content-type": "image/svg+xml" });
+      }
+
+      // ---------- History ----------
+      if (path === "/api/history" && request.method === "GET") {
+        const channel = cleanChannel(searchParams.get("channel")) || "global";
+        const since = Number(searchParams.get("since") || 0);
+        const limit = clamp(Number(searchParams.get("limit") || 100), 1, 500);
+        const idx = await getIndex(env.CLOUDCHAT, channel);
+        const ids = idx.slice(-limit);
+        const values = await batchGetJSON(env.CLOUDCHAT, ids.map(id => `msg:${channel}:${id}`));
+        const messages = values
+          .filter(Boolean)
+          .sort((a, b) => a.ts - b.ts)
+          .filter(m => m.ts > since);
+        return json({ ok: true, channel, messages, now: Date.now() });
+      }
+
+      // ---------- SSE ----------
+      if (path === "/api/stream" && request.method === "GET") {
+        return makeEventStream();
+      }
+
+      // ---------- DM list ----------
+      if (path === "/api/dmlist" && request.method === "GET") {
+        const userId = searchParams.get("user") || "";
+        if (!userId) return json({ ok: false, error: "Missing user" }, 400);
+        const peers = await getDmPeers(env.CLOUDCHAT, userId);
+        const profs = await Promise.all(peers.map(pid => env.CLOUDCHAT.get(`profile:${pid}`, "text")));
+        const out = peers.map((pid, i) => {
+          let p = null; try { p = profs[i] ? JSON.parse(profs[i]) : null; } catch {}
+          return { userId: pid, username: p?.username || "Anon", version: p?.version || 0 };
+        });
+        return json({ ok: true, peers: out });
+      }
+
+      // ---------- Message create ----------
+      if (path === "/api/message" && request.method === "POST") {
+        const ip = request.headers.get("cf-connecting-ip") || "0.0.0.0";
+        const body = await safeJSON(request);
+        if (!body || typeof body.content !== "string" || typeof body.userId !== "string") {
+          return json({ ok: false, error: "Invalid payload" }, 400);
+        }
+        const content = body.content.trim();
+        if (!content && !Array.isArray(body.attachments)) return json({ ok: false, error: "Empty message" }, 400);
+        if (content.length > 2000) return json({ ok: false, error: "Message too long" }, 400);
+        if (!rateGate(ip)) return json({ ok: false, error: "Too fast" }, 429);
+
+        const userId = body.userId;
+        const profile = await getProfile(env.CLOUDCHAT, userId);
+        const username = profile?.username?.slice(0, 40) || "Anon";
+        const avatarUrl = `/api/avatar/${encodeURIComponent(userId)}${profile?.version ? `?v=${profile.version}` : ""}`;
+        let channel = cleanChannel(body.channel) || "global";
+
+        if (isDmChannel(channel)) {
+          const [a, b] = parseDmPair(channel);
+          if (!a || !b) channel = "global";
+          else channel = dmChannelId(a, b);
+          await addDmPeer(env.CLOUDCHAT, a, b);
+          await addDmPeer(env.CLOUDCHAT, b, a);
+        } else if (isGroupChannel(channel)) {
+          const gid = groupIdFromChannel(channel);
+          const g = await getGroup(env.CLOUDCHAT, gid);
+          if (!g) return json({ ok: false, error: "Group not found" }, 404);
+          if (!g.members.includes(userId)) return json({ ok: false, error: "Not a member of this group" }, 403);
+          channel = groupChannelId(gid);
+        }
+
+        const msg = {
+          id: genId(),
+          channel,
+          userId,
+          username,
+          avatarUrl,
+          content: sanitizeText(content),
+          replyTo: typeof body.replyTo === "string" ? body.replyTo : undefined,
+          attachments: Array.isArray(body.attachments) ? body.attachments.slice(0, 3) : undefined,
+          ts: Date.now()
+        };
+
+        const ttl = 60 * 60 * 24 * 7; // 7d
+        await env.CLOUDCHAT.put(`msg:${channel}:${msg.id}`, JSON.stringify(msg), { expirationTtl: ttl });
+        await pushIndex(env.CLOUDCHAT, channel, msg.id, getMax(env.MAX_MSGS_PER_INDEX, 1000));
+
+        broadcast({ type: "message", channel, message: msg });
+        return json({ ok: true, message: msg });
+      }
+
+      // ---------- Profile ----------
+      if (path === "/api/profile" && request.method === "POST") {
+        const body = await safeJSON(request);
+        if (!body || typeof body.userId !== "string" || typeof body.username !== "string") {
+          return json({ ok: false, error: "Invalid payload" }, 400);
+        }
+        const userId = body.userId;
+        const username = body.username.trim().slice(0, 40) || "Anon";
+        const existing = await getProfile(env.CLOUDCHAT, userId);
+        const version = (existing?.version || 0) + (body.avatarData ? 1 : 0);
+        const profileObj = { userId, username, version };
+
+        if (body.avatarData && typeof body.avatarData === "string" && body.avatarData.startsWith("data:")) {
+          profileObj.avatarData = body.avatarData.slice(0, 200000);
+        } else if (existing?.avatarData && !body.avatarData) {
+          profileObj.avatarData = existing.avatarData;
+        }
+
+        await env.CLOUDCHAT.put(`profile:${userId}`, JSON.stringify(profileObj));
+        return json({ ok: true, profile: { userId, username, version, hasAvatar: !!profileObj.avatarData } });
+      }
+
+      if (path.startsWith("/api/profile/") && request.method === "GET") {
+        const userId = decodeURIComponent(path.split("/").pop() || "");
+        const profile = await getProfile(env.CLOUDCHAT, userId);
+        if (!profile) return json({ ok: false, error: "Not found" }, 404);
+        const { avatarData, ...safeProf } = profile;
+        return json({ ok: true, profile: safeProf });
+      }
+
+      if (path.startsWith("/api/avatar/") && request.method === "GET") {
+        const userId = decodeURIComponent(path.split("/").pop() || "");
+        const profile = await getProfile(env.CLOUDCHAT, userId);
+        if (!profile?.avatarData) return new Response(null, { status: 204 });
+        return dataUrlToResponse(profile.avatarData);
+      }
+
+      // ---------- Typing ----------
+      if (path === "/api/typing" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const userId = body?.userId || "";
+        const channel = cleanChannel(body?.channel) || "global";
+        const profile = await getProfile(env.CLOUDCHAT, userId);
+        const username = profile?.username || "Anon";
+        broadcast({ type: "typing", channel, userId, username, ts: Date.now() });
+        return json({ ok: true });
+      }
+
+      // ---------- Reactions ----------
+      if (path === "/api/react" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const { userId, channel: chRaw, id, emoji, op } = body || {};
+        const channel = cleanChannel(chRaw || "");
+        if (!userId || !channel || !id || !emoji || !/^(add|remove)$/.test(op || "")) {
+          return json({ ok: false, error: "Invalid payload" }, 400);
+        }
+        await updateReaction(env.CLOUDCHAT, channel, id, emoji, userId, op);
+        const summary = await getReactions(env.CLOUDCHAT, channel, [id]);
+        broadcast({ type: "reaction", channel, id, summary: summary[id] || {} });
+        return json({ ok: true });
+      }
+
+      if (path === "/api/reactions" && request.method === "GET") {
+        const channel = cleanChannel(searchParams.get("channel") || "");
+        const ids = (searchParams.get("ids") || "").split(",").map(s => s.trim()).filter(Boolean).slice(0, 200);
+        const res = await getReactions(env.CLOUDCHAT, channel, ids);
+        return json({ ok: true, reactions: res });
+      }
+
+      // ---------- Edit / Delete ----------
+      if (path === "/api/edit-message" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const { userId, channel: chRaw, id, content } = body || {};
+        const channel = cleanChannel(chRaw || "");
+        if (!userId || !channel || !id || typeof content !== "string") return json({ ok: false, error: "Invalid payload" }, 400);
+        const key = `msg:${channel}:${id}`;
+        const raw = await env.CLOUDCHAT.get(key, "text");
+        if (!raw) return json({ ok: false, error: "Not found" }, 404);
+        const msg = JSON.parse(raw);
+        const windowSec = getMax(env.EDIT_WINDOW_SECONDS, 300);
+        if (userId !== msg.userId && (!env.CLEAR_TOKEN || body.token !== env.CLEAR_TOKEN)) {
+          return json({ ok: false, error: "Forbidden" }, 403);
+        }
+        if (Date.now() - (msg.ts || 0) > windowSec * 1000 && userId === msg.userId) {
+          return json({ ok: false, error: "Edit window expired" }, 400);
+        }
+        msg.content = sanitizeText(content.trim().slice(0, 2000));
+        msg.edited = Date.now();
+        await env.CLOUDCHAT.put(key, JSON.stringify(msg));
+        broadcast({ type: "edit", channel, message: { id: msg.id, content: msg.content, edited: msg.edited } });
+        return json({ ok: true });
+      }
+
+      if (path === "/api/delete-message" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const { userId, channel: chRaw, id, token } = body || {};
+        const channel = cleanChannel(chRaw || "");
+        if (!userId || !channel || !id) return json({ ok: false, error: "Invalid payload" }, 400);
+        const key = `msg:${channel}:${id}`;
+        const raw = await env.CLOUDCHAT.get(key, "text");
+        if (!raw) return json({ ok: false, error: "Not found" }, 404);
+        const msg = JSON.parse(raw);
+        if (userId !== msg.userId && (!env.CLEAR_TOKEN || token !== env.CLEAR_TOKEN)) {
+          return json({ ok: false, error: "Forbidden" }, 403);
+        }
+        msg.deleted = true;
+        msg.content = "";
+        await env.CLOUDCHAT.put(key, JSON.stringify(msg));
+        broadcast({ type: "delete", channel, id });
+        return json({ ok: true });
+      }
+
+      // ---------- Pins ----------
+      if (path === "/api/pins" && request.method === "GET") {
+        const channel = cleanChannel(searchParams.get("channel") || "");
+        const pins = await getPins(env.CLOUDCHAT, channel);
+        return json({ ok: true, pins });
+      }
+      if (path === "/api/pin" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const { userId, channel: chRaw, id, op, token } = body || {};
+        const channel = cleanChannel(chRaw || "");
+        if (!userId || !channel || !id || !/^(add|remove)$/.test(op || "")) return json({ ok: false, error: "Invalid payload" }, 400);
+        const msgRaw = await env.CLOUDCHAT.get(`msg:${channel}:${id}`, "text");
+        if (!msgRaw) return json({ ok: false, error: "Message not found" }, 404);
+        const msg = JSON.parse(msgRaw);
+        if (userId !== msg.userId && (!env.CLEAR_TOKEN || token !== env.CLEAR_TOKEN)) {
+          return json({ ok: false, error: "Forbidden" }, 403);
+        }
+        await togglePin(env.CLOUDCHAT, channel, id, op);
+        broadcast({ type: "pin", channel, id, op });
+        return json({ ok: true });
+      }
+
+      // ---------- Clear Global / Clear DM ----------
+      if (path === "/api/clear" && request.method === "POST") {
+        let token = request.headers.get("x-admin") || "";
+        const body = await safeJSON(request);
+        if (!token && body && typeof body.token === "string") token = body.token;
+        if (env.CLEAR_TOKEN && token !== env.CLEAR_TOKEN) {
+          return json({ ok: false, error: "Forbidden" }, 403);
+        }
+        const deleted = await clearChannelMessages(env.CLOUDCHAT, "global");
+        broadcast({ type: "cleared-channel", channel: "global", count: deleted });
+        return json({ ok: true, deleted });
+      }
+
+      if (path === "/api/clear-channel" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const channel = cleanChannel(body?.channel || "");
+        const userId = body?.userId || "";
+        if (!channel || !isDmChannel(channel)) {
+          return json({ ok: false, error: "Only DM channels can be cleared here" }, 400);
+        }
+        const [a, b] = parseDmPair(channel);
+        const canon = dmChannelId(a, b);
+        if (userId !== a && userId !== b) {
+          return json({ ok: false, error: "Not a participant" }, 403);
+        }
+        const deleted = await clearChannelMessages(env.CLOUDCHAT, canon);
+        broadcast({ type: "cleared-channel", channel: canon, count: deleted });
+        return json({ ok: true, channel: canon, deleted });
+      }
+
+      // ---------- Presence ----------
+      if (path === "/api/ping" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const uid = body?.userId || "";
+        if (uid) await env.CLOUDCHAT.put(`presence:${uid}`, String(Date.now()), { expirationTtl: 180 });
+        return json({ ok: true });
+      }
+      if (path === "/api/presence" && request.method === "GET") {
+        const ids = (searchParams.get("ids") || "").split(",").map(s => s.trim()).filter(Boolean).slice(0, 200);
+        const res = {};
+        if (ids.length) {
+          const gets = await Promise.all(ids.map(id => env.CLOUDCHAT.get(`presence:${id}`, "text")));
+          ids.forEach((id, i) => { res[id] = !!gets[i]; });
+        }
+        return json({ ok: true, presence: res });
+      }
+
+      // ---------- Attachments ----------
+      if (path === "/api/upload" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const { userId, dataUrl } = body || {};
+        if (!userId || typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) {
+          return json({ ok: false, error: "Invalid image" }, 400);
+        }
+        const b64 = dataUrl.split(",")[1] || "";
+        const sizeKB = Math.ceil((b64.length * 3) / 4 / 1024);
+        const maxKB = getMax(env.MAX_ATTACHMENT_KB, 400);
+        if (sizeKB > maxKB) return json({ ok: false, error: `Image too large (> ${maxKB}KB)` }, 400);
+        const id = genId();
+        await env.CLOUDCHAT.put(`attach:${id}`, dataUrl, { expirationTtl: 60 * 60 * 24 * 7 });
+        return json({ ok: true, id, url: `/api/attach/${id}` });
+      }
+
+      if (path.startsWith("/api/attach/") && request.method === "GET") {
+        const id = decodeURIComponent(path.split("/").pop() || "");
+        const dataUrl = await env.CLOUDCHAT.get(`attach:${id}`, "text");
+        if (!dataUrl) return new Response(null, { status: 404 });
+        return dataUrlToResponse(dataUrl);
+      }
+
+      // ---------- Link Previews ----------
+      if (path === "/api/og" && request.method === "GET") {
+        const u = (searchParams.get("u") || "").trim();
+        if (!/^https?:\/\//i.test(u)) return json({ ok: false, error: "Invalid URL" }, 400);
+        try {
+          const resp = await fetch(u, { redirect: "follow", cf: { cacheTtl: 3600, cacheEverything: true } });
+          const type = resp.headers.get("content-type") || "";
+          if (!type.includes("text/html")) return json({ ok: true, title: u });
+          const textHtml = await resp.text();
+          const title = (textHtml.match(/<title[^>]*>([^<]{0,120})<\/title>/i) || [])[1] || "";
+          const ogTitle = (textHtml.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']{0,120})["']/i) || [])[1] || "";
+          const desc = (textHtml.match(/<meta[^>]+name=["']description["'][^>]*content=["']([^"']{0,200})["']/i) || [])[1] || "";
+          const ogDesc = (textHtml.match(/<meta[^>]+property=["']og:description["'][^>]*content=["']([^"']{0,200})["']/i) || [])[1] || "";
+          const ogImg = (textHtml.match(/<meta[^>]+property=["']og:image["'][^>]*content=["']([^"'>]{0,300})["']/i) || [])[1] || "";
+          return json({ ok: true, title: ogTitle || title || "", description: ogDesc || desc || "", image: ogImg || "" });
+        } catch {
+          return json({ ok: true, title: u });
+        }
+      }
+
+      // ---------- Group APIs ----------
+      if (path === "/api/grouplist" && request.method === "GET") {
+        const userId = searchParams.get("user") || "";
+        if (!userId) return json({ ok: false, error: "Missing user" }, 400);
+        const ids = await getGroupsForUser(env.CLOUDCHAT, userId);
+        const raws = await Promise.all(ids.map(id => env.CLOUDCHAT.get(`group:${id}`, "text")));
+        const groups = [];
+        for (let i=0;i<ids.length;i++){
+          let g=null; try{ g = raws[i] ? JSON.parse(raws[i]) : null; }catch{}
+          if (g) groups.push({ id:g.id, name:g.name, ownerId:g.ownerId, memberCount: (g.members||[]).length });
+        }
+        return json({ ok: true, groups });
+      }
+
+      if (path === "/api/group/info" && request.method === "GET") {
+        const groupId = searchParams.get("groupId") || "";
+        const g = await getGroup(env.CLOUDCHAT, groupId);
+        if (!g) return json({ ok:false, error:"Not found" }, 404);
+        const safe = { id:g.id, name:g.name, ownerId:g.ownerId, memberCount:(g.members||[]).length };
+        return json({ ok:true, group: safe });
+      }
+
+      if (path === "/api/group/members" && request.method === "GET") {
+        const groupId = searchParams.get("groupId") || "";
+        const g = await getGroup(env.CLOUDCHAT, groupId);
+        if (!g) return json({ ok:false, error:"Not found" }, 404);
+        const profs = await Promise.all((g.members||[]).map(uid => env.CLOUDCHAT.get(`profile:${uid}`, "text")));
+        const out = (g.members||[]).map((uid, i) => {
+          let p=null; try{ p = profs[i] ? JSON.parse(profs[i]) : null; }catch{}
+          return { userId: uid, username: p?.username || "Anon", version: p?.version || 0 };
+        });
+        return json({ ok:true, members: out });
+      }
+
+      if (path === "/api/group/create" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const userId = body?.userId || "";
+        let name = (body?.name || "").trim().slice(0, 40);
+        if (!userId || !name) return json({ ok:false, error:"Missing user or name" }, 400);
+        const id = genShortId("g");
+        const group = { id, name, ownerId: userId, members: [userId], createdTs: Date.now() };
+        await env.CLOUDCHAT.put(`group:${id}`, JSON.stringify(group));
+        await addUserToGroups(env.CLOUDCHAT, userId, id);
+        return json({ ok:true, group: { id, name, ownerId:userId, memberCount:1 } });
+      }
+
+      if (path === "/api/group/join" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const userId = body?.userId || "";
+        const groupId = (body?.groupId || "").trim();
+        const g = await getGroup(env.CLOUDCHAT, groupId);
+        if (!userId || !g) return json({ ok:false, error:"Invalid user or group" }, 400);
+        if (!g.members.includes(userId)) {
+          g.members.push(userId);
+          g.members = g.members.slice(-500); // cap
+          await env.CLOUDCHAT.put(`group:${g.id}`, JSON.stringify(g));
+          await addUserToGroups(env.CLOUDCHAT, userId, g.id);
+        }
+        return json({ ok:true, group:{ id:g.id, name:g.name, ownerId:g.ownerId, memberCount:g.members.length } });
+      }
+
+      if (path === "/api/group/leave" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const userId = body?.userId || "";
+        const groupId = (body?.groupId || "").trim();
+        const g = await getGroup(env.CLOUDCHAT, groupId);
+        if (!userId || !g) return json({ ok:false, error:"Invalid user or group" }, 400);
+        const idx = g.members.indexOf(userId);
+        if (idx >= 0) g.members.splice(idx,1);
+        await removeUserFromGroups(env.CLOUDCHAT, userId, g.id);
+
+        if (g.members.length === 0) {
+          // delete group + content
+          await env.CLOUDCHAT.delete(`group:${g.id}`);
+          await clearChannelMessages(env.CLOUDCHAT, groupChannelId(g.id));
+          broadcast({ type: "cleared-channel", channel: groupChannelId(g.id), count: 0 });
+          return json({ ok:true, deleted:true });
+        }
+        if (g.ownerId === userId) {
+          g.ownerId = g.members[0]; // transfer ownership
+        }
+        await env.CLOUDCHAT.put(`group:${g.id}`, JSON.stringify(g));
+        return json({ ok:true, group:{ id:g.id, name:g.name, ownerId:g.ownerId, memberCount:g.members.length } });
+      }
+
+      if (path === "/api/clear-group" && request.method === "POST") {
+        const body = await safeJSON(request);
+        const userId = body?.userId || "";
+        const groupId = (body?.groupId || "").trim();
+        const g = await getGroup(env.CLOUDCHAT, groupId);
+        if (!userId || !g) return json({ ok:false, error:"Invalid user or group" }, 400);
+        const token = (body?.token || request.headers.get("x-admin") || "");
+        const isOwner = g.ownerId === userId;
+        if (!isOwner && (!env.CLEAR_TOKEN || token !== env.CLEAR_TOKEN)) {
+          return json({ ok:false, error:"Forbidden" }, 403);
+        }
+        const ch = groupChannelId(g.id);
+        const deleted = await clearChannelMessages(env.CLOUDCHAT, ch);
+        broadcast({ type:"cleared-channel", channel: ch, count: deleted });
+        return json({ ok:true, groupId:g.id, deleted });
+      }
+
+      return text("Not Found", 404);
+    } catch (err) {
+      return json({ ok: false, error: (err && err.message) || String(err) }, 500);
+    }
+  }
+};
+
+// --------------------- Utils & KV helpers ---------------------
+function normalizePath(p){ try{ return decodeURIComponent(p); } catch{ return p; } }
+function withHeaders(body, headers={}){ return new Response(body,{ headers }); }
+function text(body, status=200, headers={}){ return new Response(String(body), { status, headers: { "content-type":"text/plain; charset=UTF-8", ...headers } }); }
+function json(obj, status=200, headers={}){ return new Response(JSON.stringify(obj), { status, headers: { "content-type":"application/json; charset=UTF-8", ...headers } }); }
+function clamp(n,min,max){ return Math.max(min, Math.min(max,n)); }
+function genId(){ return `${Date.now()}-${Math.random().toString(36).slice(2,8)}`; }
+function genShortId(prefix="g"){ return `${prefix}${Math.random().toString(36).slice(2,8)}`; }
+function sanitizeText(s){ return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+async function safeJSON(request){ const ct=(request.headers.get("content-type")||"").toLowerCase(); if (!ct.includes("application/json")) return null; const t=await request.text(); try{ return JSON.parse(t); }catch{ return null; } }
+async function batchGetJSON(kv, keys){ if (!keys.length) return []; const out = await Promise.all(keys.map(k => kv.get(k,"text"))); return out.map(x => { try{ return x?JSON.parse(x):null; }catch{ return null; } }); }
+function getMax(envVal, dflt){ const n = Number(envVal); return Number.isFinite(n) && n>0 ? n : dflt; }
+
+// Channels
+function cleanChannel(ch){
+  ch=(ch||"").trim();
+  if (!ch) return "";
+  if (isDmChannel(ch)) return dmChannelId(...parseDmPair(ch));
+  if (isGroupChannel(ch)) return groupChannelId(groupIdFromChannel(ch));
+  return (ch==="global"?"global":"global");
+}
+function isDmChannel(ch){ return typeof ch==="string" && ch.startsWith("dm:"); }
+function parseDmPair(ch){ const parts=(ch||"").split(":"); return [parts[1], parts[2]]; }
+function dmChannelId(a,b){ const arr=[String(a||""),String(b||"")].sort(); return `dm:${arr[0]}:${arr[1]}`; }
+function isGroupChannel(ch){ return typeof ch==="string" && ch.startsWith("grp:"); }
+function groupIdFromChannel(ch){ return (ch||"").split(":")[1] || ""; }
+function groupChannelId(id){ return `grp:${String(id||"")}`; }
+
+// Index per channel
+async function getIndex(kv, channel="global"){
+  const raw = await kv.get(`index:${channel}`,"text");
+  if (!raw) return [];
+  try { const arr = JSON.parse(raw); return Array.isArray(arr) ? arr : []; } catch { return []; }
+}
+async function pushIndex(kv, channel, id, maxLen=1000){
+  let arr = await getIndex(kv, channel);
+  arr.push(id);
+  if (arr.length > maxLen) arr = arr.slice(-maxLen);
+  await kv.put(`index:${channel}`, JSON.stringify(arr));
+}
+
+// Profiles
+async function getProfile(kv, userId){
+  if (!userId) return null;
+  const raw = await kv.get(`profile:${userId}`,"text");
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+function dataUrlToResponse(dataUrl){
+  try{
+    const [meta,b64] = dataUrl.split(",");
+    const mime = (meta.split(":")[1]||"application/octet-stream").split(";")[0]||"application/octet-stream";
+    const binStr = atob(b64||"");
+    const buf = new Uint8Array(binStr.length);
+    for (let i=0;i<binStr.length;i++) buf[i]=binStr.charCodeAt(i);
+    return new Response(buf,{ headers:{ "content-type": mime, "cache-control":"public, max-age=3600" }});
+  }catch{ return new Response(null,{status:204}); }
+}
+
+// DMs list
+async function getDmPeers(kv, userId){
+  const raw = await kv.get(`dmset:${userId}`,"text");
+  if (!raw) return [];
+  try { const arr = JSON.parse(raw); return Array.isArray(arr) ? arr : []; } catch { return []; }
+}
+async function addDmPeer(kv, userId, peerId){
+  if (!userId || !peerId) return;
+  const set = new Set(await getDmPeers(kv, userId));
+  set.add(peerId);
+  await kv.put(`dmset:${userId}`, JSON.stringify([...set].slice(-200)));
+}
+
+// Reactions
+async function updateReaction(kv, channel, id, emoji, userId, op){
+  const key = `react:${channel}:${id}`;
+  let obj=null; try{ const raw=await kv.get(key,"text"); obj=raw?JSON.parse(raw):null; }catch{}
+  obj = obj && typeof obj==="object" ? obj : {};
+  obj[emoji] = Array.isArray(obj[emoji]) ? obj[emoji] : [];
+  const set = new Set(obj[emoji]);
+  if (op==="add") set.add(userId); else set.delete(userId);
+  obj[emoji] = [...set].slice(0, 500);
+  await kv.put(key, JSON.stringify(obj), { expirationTtl: 60*60*24*7 });
+}
+async function getReactions(kv, channel, ids){
+  const res = {};
+  if (!ids || !ids.length) return res;
+  const keys = ids.map(id => `react:${channel}:${id}`);
+  const raws = await Promise.all(keys.map(k => kv.get(k,"text")));
+  ids.forEach((id,i)=>{
+    let o=null; try{ o = raws[i]?JSON.parse(raws[i]):null; }catch{}
+    if (!o) return;
+    const sums={};
+    Object.keys(o).forEach(e=> sums[e] = Array.isArray(o[e]) ? o[e].length : 0);
+    res[id]=sums;
+  });
+  return res;
+}
+
+// Pins
+async function getPins(kv, channel){
+  const raw = await kv.get(`pins:${channel}`,"text");
+  if (!raw) return [];
+  try { const arr = JSON.parse(raw); return Array.isArray(arr) ? arr : []; } catch { return []; }
+}
+async function togglePin(kv, channel, id, op){
+  const set = new Set(await getPins(kv, channel));
+  if (op==="add") set.add(id); else set.delete(id);
+  await kv.put(`pins:${channel}`, JSON.stringify([...set].slice(-50)));
+}
+
+// Clearing
+async function clearChannelMessages(kv, channel){
+  let cursor; let total=0; const prefix=`msg:${channel}:`;
+  do{
+    const { keys, list_complete, cursor: next } = await kv.list({ prefix, cursor });
+    const names = (keys||[]).map(k=>k.name);
+    for (let i=0;i<names.length;i+=50) {
+      await Promise.all(names.slice(i,i+50).map(n => kv.delete(n)));
+    }
+    total += names.length;
+    cursor = list_complete ? undefined : next;
+  }while(cursor);
+  await kv.delete(`index:${channel}`);
+  // clear reactions and pins too
+  let c2;
+  do{
+    const { keys, list_complete, cursor: next } = await kv.list({ prefix:`react:${channel}:`, cursor:c2 });
+    const names = (keys||[]).map(k=>k.name);
+    for (let i=0;i<names.length;i+=50) await Promise.all(names.slice(i,i+50).map(n => kv.delete(n)));
+    c2 = list_complete ? undefined : next;
+  }while(c2);
+  await kv.delete(`pins:${channel}`);
+  return total;
+}
+
+// Presence rate gate
+const _rate = new Map();
+function rateGate(ip){ const now=Date.now(); const last=_rate.get(ip)||0; if (now-last<800) return false; _rate.set(ip, now); return true; }
+
+// Broadcast & SSE
+function broadcast(payload){
+  try{ const bc=new BroadcastChannel("cloudchat"); bc.postMessage(payload); bc.close(); }catch{}
+}
+function makeEventStream(){
+  const stream = new ReadableStream({
+    start(controller){
+      const enc = new TextEncoder();
+      const write=(event,data)=>controller.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      write("hello",{ now: Date.now() });
+      let hb = setInterval(()=>controller.enqueue(enc.encode(`:ping\n\n`)), 25000);
+      let bc;
+      try{
+        bc=new BroadcastChannel("cloudchat");
+        bc.onmessage=(evt)=>{
+          const d=evt?.data;
+          if (!d || !d.type) return;
+          switch(d.type){
+            case "message": write("message",{ channel:d.channel, message:d.message }); break;
+            case "typing": write("typing",{ channel:d.channel, userId:d.userId, username:d.username, ts:d.ts }); break;
+            case "reaction": write("reaction",{ channel:d.channel, id:d.id, summary:d.summary }); break;
+            case "edit": write("edit",{ channel:d.channel, message:d.message }); break;
+            case "delete": write("delete",{ channel:d.channel, id:d.id }); break;
+            case "pin": write("pin",{ channel:d.channel, id:d.id, op:d.op }); break;
+            case "cleared-channel": write("cleared-channel",{ channel:d.channel, count:d.count||0, ts:Date.now() }); break;
+          }
+        };
+      }catch{}
+      this._cleanup=()=>{ try{ if (bc) bc.close(); }catch{} try{ clearInterval(hb); }catch{} };
+    },
+    cancel(){ try{ this._cleanup && this._cleanup(); }catch{} }
+  });
+  return new Response(stream,{
+    headers:{
+      "content-type":"text/event-stream; charset=utf-8",
+      "cache-control":"no-store",
+      "x-content-type-options":"nosniff"
+    }
+  });
+}
+
+// --------------------- Groups helpers ---------------------
+async function getGroup(kv, id){
+  if (!id) return null;
+  const raw = await kv.get(`group:${id}`, "text");
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+async function addUserToGroups(kv, userId, groupId){
+  const raw = await kv.get(`groupset:${userId}`, "text");
+  let arr=[]; if (raw) try{ arr = JSON.parse(raw)||[]; }catch{}
+  const set = new Set(arr); set.add(groupId);
+  await kv.put(`groupset:${userId}`, JSON.stringify([...set].slice(-500)));
+}
+async function removeUserFromGroups(kv, userId, groupId){
+  const raw = await kv.get(`groupset:${userId}`, "text");
+  if (!raw) return;
+  let arr=[]; try{ arr = JSON.parse(raw)||[]; }catch{}
+  const set = new Set(arr); set.delete(groupId);
+  await kv.put(`groupset:${userId}`, JSON.stringify([...set]));
+}
+async function getGroupsForUser(kv, userId){
+  const raw = await kv.get(`groupset:${userId}`, "text");
+  if (!raw) return [];
+  try { const arr = JSON.parse(raw); return Array.isArray(arr)?arr:[]; } catch { return []; }
+}
+
+// --------------------- Favicon ---------------------
+function faviconSVG(){
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5865F2"/><stop offset="1" stop-color="#4752C4"/></linearGradient></defs>
+  <rect x="6" y="6" width="52" height="52" rx="14" fill="url(#g)"/>
+  <text x="50%" y="54%" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-weight="800" font-size="26" fill="#ffffff">CC</text>
+</svg>`;
+}
+
+// --------------------- HTML (UI) ---------------------
+function viewHTML(){
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CloudChat</title>
+<link rel="icon" href="/favicon.svg" sizes="any" type="image/svg+xml" />
+<style>
+:root{
+  --bg:#111214; --bg-elev:#1e1f22; --bg-hover:#2b2d31;
+  --text:#f2f3f5; --muted:#b5bac1; --accent:#5865f2; --accent-2:#4752c4;
+  --danger:#f23f42; --ok:#23a55a; --border:#26282c; --shadow:rgba(0,0,0,.45);
+  --yellow:#f0b232;
+}
+*{ box-sizing:border-box }
+html,body{ height:100%; margin:0; background:var(--bg); color:var(--text);
+  font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji"; }
+.app{ display:grid; grid-template-columns: 72px 300px 1fr; grid-template-rows: 48px 1fr 88px; height:100vh; overflow:hidden }
+.sidebar{ grid-row:1 / span 3; grid-column:1; background:#1a1b1e; border-right:1px solid var(--border);
+  display:flex; flex-direction:column; align-items:center; gap:12px; padding:12px 8px; overflow-y:auto }
+.server{ width:48px; height:48px; border-radius:50%; background:var(--accent); display:grid; place-items:center;
+  color:#fff; font-weight:800; letter-spacing:.5px; box-shadow:0 8px 20px var(--shadow); position:relative; flex:0 0 auto }
+.server .dot{ position:absolute; right:-2px; bottom:-2px; width:12px; height:12px; border-radius:50%; background:#555; border:2px solid #1a1b1e; }
+
+.chanlist{ grid-column:2; grid-row:1 / span 3; background:var(--bg-elev); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; min-width:0; overflow-y:auto }
+.chan-head{ height:48px; display:flex; align-items:center; padding:0 12px; border-bottom:1px solid var(--border); font-weight:700; letter-spacing:.3px; flex:0 0 auto }
+.subhead{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; padding:8px 12px;
+  display:flex; align-items:center; justify-content:space-between; gap:8px; position:sticky; top:0; background:var(--bg-elev); z-index:1; border-bottom:1px solid transparent }
+.subhead .btn{ padding:4px 8px; font-size:12px }
+.chan-item{ padding:8px 12px; display:flex; align-items:center; gap:8px; color:var(--muted); cursor:pointer; border-radius:8px; margin:4px 8px; position:relative }
+.chan-item.active,.chan-item:hover{ background:var(--bg-hover); color:var(--text) }
+.chan-item .avatar{ width:22px; height:22px; font-size:11px; position:relative; flex:0 0 auto }
+.chan-item .presence{ position:absolute; right:-2px; bottom:-2px; width:10px; height:10px; border-radius:50%; background:#555; border:2px solid var(--bg-elev) }
+.badge{ position:absolute; right:10px; top:8px; background:var(--accent); color:#fff; border-radius:10px; padding:0 6px; font-size:11px; line-height:18px; height:18px; min-width:18px; text-align:center }
+
+.header{ grid-column:3; grid-row:1; display:flex; align-items:center; gap:8px; padding:0 16px;
+  border-bottom:1px solid var(--border); background:var(--bg-elev); position:relative; z-index:1; min-width:0 }
+.header h1{ font-size:16px; margin:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+.typing{ margin-left:8px; color:var(--muted); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:40% }
+.spacer{ flex:1; min-width:8px }
+.btn{ background:var(--bg-hover); border:1px solid var(--border); color:var(--text); border-radius:8px; padding:6px 10px; cursor:pointer; transition:transform .05s ease, background .15s ease; }
+.btn:hover{ background:#313338 } .btn:active{ transform:translateY(1px) }
+.btn.primary{ background:var(--accent); border-color:var(--accent-2); color:#fff }
+.btn.danger{ background:#3e1f22; border-color:#4b1f23; color:#ffb3b6 } .btn.danger:hover{ background:#541f24 }
+.btn.ghost{ background:transparent; border-color:var(--border); color:var(--muted) }
+
+.gidchip{ display:none; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size:12px; padding:2px 6px; border-radius:6px; background:#2b2d31; border:1px solid var(--border); color:var(--muted); cursor:pointer; }
+.gidchip:hover{ color:var(--text); }
+
+.messages{ grid-column:3; grid-row:2; overflow-y:auto; padding:16px 24px; display:flex; flex-direction:column; gap:12px; min-width:0 }
+.msg{ display:grid; grid-template-columns:40px 1fr; gap:12px; position:relative }
+.msg:hover .actions{ opacity:1; pointer-events:auto }
+.avatar{ width:40px; height:40px; border-radius:50%; background:#2b2d31; overflow:hidden; display:grid; place-items:center; font-weight:800; color:#dfe2e5; position:relative; flex:0 0 auto }
+.avatar img{ width:100%; height:100%; object-fit:cover; display:block }
+.bubble{ background:var(--bg-elev); border:1px solid var(--border); padding:10px 12px; border-radius:10px; box-shadow:0 4px 12px var(--shadow); min-width:0 }
+.meta{ display:flex; align-items:baseline; gap:8px; flex-wrap:wrap }
+.name{ font-weight:700 } .name.dmable{ cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px }
+.time{ color:var(--muted); font-size:12px }
+.content{ white-space:pre-wrap; word-break:break-word }
+.reply{ border-left:3px solid var(--border); padding-left:8px; margin-bottom:6px; color:var(--muted); font-size:13px }
+.attach{ margin-top:8px; display:flex; gap:8px; flex-wrap:wrap }
+.attach img{ max-width:220px; max-height:180px; border-radius:8px; border:1px solid var(--border) }
+.reactions{ display:flex; gap:6px; margin-top:6px; flex-wrap:wrap }
+.react{ background:#2b2d31; border:1px solid var(--border); border-radius:12px; padding:2px 8px; font-size:13px; cursor:pointer }
+.react.mine{ border-color: var(--accent) }
+.react-add{ padding:2px 8px; border-radius:12px; border:1px dashed var(--border); background:transparent; color:var(--muted); cursor:pointer }
+.actions{ position:absolute; right:0; top:-6px; display:flex; gap:6px; opacity:0; pointer-events:none; transition:opacity .12s }
+.action{ background:#2b2d31; border:1px solid var(--border); color:var(--muted); padding:2px 6px; border-radius:6px; font-size:12px; cursor:pointer }
+.action:hover{ color:var(--text) }
+
+.preview{ margin-top:8px; border:1px solid var(--border); border-radius:10px; overflow:hidden }
+.preview .ph{ padding:10px 12px; background:#1b1d22; color:var(--muted); font-size:13px }
+.preview .row{ display:flex; gap:10px; }
+.preview img{ width:120px; height:120px; object-fit:cover; display:block; }
+
+.composer{ grid-column:3; grid-row:3; border-top:1px solid var(--border); background:var(--bg-elev);
+  padding:12px 16px; display:grid; grid-template-columns:1fr auto auto; gap:10px; box-shadow:0 -10px 30px var(--shadow); min-width:0 }
+.replying{ grid-column:1 / span 3; padding:8px 10px; background:#1b1d22; border:1px solid var(--border); border-radius:8px; margin-top:-6px; margin-bottom:8px; display:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.replying strong{ color:#fff } .replying .x{ float:right; cursor:pointer; color:var(--muted) }
+.attachbar{ grid-column:1 / span 3; display:flex; gap:8px; flex-wrap:wrap; margin-top:8px }
+.attchip{ background:#2b2d31; border:1px solid var(--border); border-radius:8px; padding:4px 8px; display:flex; gap:6px; align-items:center }
+.attchip .x{ cursor:pointer; color:var(--muted) }
+.input{ width:100%; background:#2b2d31; color:var(--text); border:1px solid var(--border); border-radius:10px; padding:12px; outline:none; resize:none; height:56px; }
+.send{ padding:10px 16px; background:var(--accent); border:none; color:white; border-radius:8px; font-weight:700; cursor:pointer }
+.send:disabled{ opacity:.5; cursor:not-allowed }
+
+.modal-back{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(0,0,0,.6) }
+.modal{ width:min(600px, 92vw); background:var(--bg-elev); border:1px solid var(--border); border-radius:12px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.5) }
+.modal h2{ margin:0 0 8px } .row{ display:flex; gap:12px; align-items:center; margin:8px 0; flex-wrap:wrap }
+.field{ flex:1; min-width:220px } .field input[type="text"]{ width:100%; padding:10px 12px; background:#2b2d31; color:var(--text); border:1px solid var(--border); border-radius:8px }
+.avatar-prev{ width:64px; height:64px; border-radius:50%; background:#2b2d31; overflow:hidden; display:grid; place-items:center; font-weight:800; color:#dfe2e5 }
+.hint{ color:var(--muted); font-size:12px }
+.mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+
+.pins-panel{ position:fixed; right:16px; top:64px; width:min(420px, 92vw); max-height:70vh; overflow:auto; background:var(--bg-elev); border:1px solid var(--border); border-radius:12px; display:none; box-shadow:0 10px 30px rgba(0,0,0,.5); padding:10px; }
+
+@media (max-width: 1000px){
+  .app{ grid-template-columns:72px 1fr; grid-template-rows:48px 1fr 88px }
+  .chanlist{ display:none }
+}
+</style>
+</head>
+<body>
+  <div class="app">
+    <div class="sidebar">
+      <div class="server" title="CloudChat">CC <span class="dot" id="meDot"></span></div>
+    </div>
+
+    <div class="chanlist">
+      <div class="chan-head">CloudChat</div>
+
+      <div id="globalItem" class="chan-item active" data-channel="global"># global <span id="badge-global" class="badge" style="display:none">0</span></div>
+
+      <div class="subhead">
+        <span>Direct Messages</span>
+        <button class="btn" id="newDmBtn" title="Start a DM">New</button>
+      </div>
+      <div id="dmList" style="padding-bottom:8px;"></div>
+
+      <div class="subhead">
+        <span>Group Chats</span>
+        <div style="display:flex; gap:6px">
+          <button class="btn" id="newGroupBtn" title="Create a group">New</button>
+          <button class="btn" id="joinGroupBtn" title="Join by ID">Join</button>
+        </div>
+      </div>
+      <div id="grpList" style="padding-bottom:8px;"></div>
+
+      <div style="margin-top:auto; padding: 10px; border-top: 1px solid var(--border);">
+        <div style="display:flex; align-items:center; gap:10px;">
+          <div class="avatar" id="meAvatarSmall">CC</div>
+          <div style="flex:1; min-width:0;">
+            <div id="meName" style="font-weight:700;">Anonymous</div>
+            <div class="hint" id="meId" style="user-select: all; overflow:hidden; text-overflow:ellipsis;"></div>
+            <div class="hint">Prefs: <span id="prefsSummary"></span></div>
+          </div>
+          <button class="btn" id="openSettings">Settings</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="header">
+      <h1 id="chanTitle"># global</h1>
+      <code id="gidChip" class="gidchip" title="Click to copy group ID"></code>
+      <div id="typing" class="typing" style="display:none;"></div>
+      <div class="spacer"></div>
+      <button class="btn" id="pinsBtn" title="Pinned messages">Pins</button>
+      <button class="btn" id="refreshBtn" title="Refresh history">Refresh</button>
+      <button class="btn ghost" id="leaveGroupBtn" title="Leave this group" style="display:none;">Leave Group</button>
+      <button class="btn danger" id="clearGroupBtn" title="Clear messages in this group (owner only)" style="display:none;">Clear Group</button>
+      <button class="btn danger" id="clearDmBtn" title="Clear only this DM" style="display:none;">Clear DM</button>
+      <button class="btn danger" id="clearBtn" title="Clear ALL messages in #global">Clear All</button>
+    </div>
+
+    <div class="messages" id="messages"></div>
+
+    <div class="composer">
+      <div class="replying" id="replying"><strong>Replying to <span id="replyName"></span></strong> — <span id="replySnippet"></span> <span class="x" id="replyCancel">✕</span></div>
+      <textarea class="input" id="composer" placeholder="Message #global" maxlength="2000"></textarea>
+      <input type="file" id="attachInput" accept="image/*" multiple style="display:none" />
+      <button class="btn" id="attachBtn" title="Attach images (or paste/drag into chat)">📎 Attach</button>
+      <button class="send" id="sendBtn">Send</button>
+      <div class="attachbar" id="attachbar"></div>
+    </div>
+  </div>
+
+  <div class="pins-panel" id="pinsPanel">
+    <div style="display:flex;align-items:center;gap:10px; margin-bottom:6px;">
+      <strong>Pinned in <span id="pinsLabel">#global</span></strong>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="pinsClose">Close</button>
+    </div>
+    <div id="pinsList"></div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal-back" id="modalBack">
+    <div class="modal">
+      <h2>Profile & Preferences</h2>
+      <div class="row">
+        <div class="avatar-prev" id="avatarPrev">CC</div>
+        <div class="field">
+          <label>Username</label>
+          <input type="text" id="username" placeholder="Your name" maxlength="40" />
+          <div class="hint">Pick a name (40 chars max). Defaults to “Anon”.</div>
+        </div>
+      </div>
+      <div class="row">
+        <input type="file" id="avatarFile" accept="image/*" />
+        <div class="hint">Optional avatar (resized to ~128×128).</div>
+      </div>
+      <div class="row">
+        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="prefAutoOpen" checked /> Auto-open new DMs</label>
+        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="prefTyping" checked /> Show typing indicators</label>
+        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="prefPing" /> Play sound on new DM</label>
+      </div>
+      <div class="row" style="justify-content:flex-end; margin-top: 16px;">
+        <button class="btn ghost" id="copyIdBtn" title="Copy my user ID">Copy ID</button>
+        <button class="btn" id="cancelSettings">Cancel</button>
+        <button class="btn primary" id="saveSettings">Save</button>
+      </div>
+      <div class="hint">Slash: <code>/nick NAME</code>, <code>/dm USERID message…</code>, <code>/me action…</code></div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  // ---------- Shortcuts ----------
+  var $ = sel => document.querySelector(sel);
+  var messagesEl = $('#messages'), inputEl = $('#composer'), sendBtn = $('#sendBtn');
+  var refreshBtn = $('#refreshBtn'), clearBtn = $('#clearBtn'), clearDmBtn = $('#clearDmBtn'), clearGroupBtn = $('#clearGroupBtn'), leaveGroupBtn = $('#leaveGroupBtn');
+  var globalItem = $('#globalItem'), dmListEl = $('#dmList'), newDmBtn = $('#newDmBtn'), badgeGlobal = $('#badge-global');
+  var grpListEl = $('#grpList'), newGroupBtn = $('#newGroupBtn'), joinGroupBtn = $('#joinGroupBtn');
+  var modalBack = $('#modalBack'), openSettingsBtn = $('#openSettings'), cancelSettingsBtn = $('#cancelSettings'), saveSettingsBtn = $('#saveSettings');
+  var copyIdBtn = $('#copyIdBtn'), prefAutoOpen = $('#prefAutoOpen'), prefTyping = $('#prefTyping'), prefPing = $('#prefPing');
+  var usernameEl = $('#username'), avatarPrev = $('#avatarPrev'), avatarSmall = $('#meAvatarSmall'), meName = $('#meName'), meId = $('#meId'), prefsSummary = $('#prefsSummary'), chanTitle = $('#chanTitle'), typingEl = $('#typing');
+  var pinsBtn = $('#pinsBtn'), pinsPanel = $('#pinsPanel'), pinsClose = $('#pinsClose'), pinsList = $('#pinsList'), pinsLabel = $('#pinsLabel');
+  var replyWrap = $('#replying'), replyName = $('#replyName'), replySnippet = $('#replySnippet'), replyCancel = $('#replyCancel'), attachbar = $('#attachbar');
+  var meDot = $('#meDot');
+  var attachBtn = $('#attachBtn'), attachInput = $('#attachInput');
+  var gidChip = $('#gidChip');
+
+  var uid = getOrMakeId(); meId.textContent = uid;
+  var prefs = loadPrefs() || { autoOpenDM:true, typing:true, ping:false };
+  applyPrefsToUI();
+
+  var profile = loadProfileLocal() || { userId: uid, username: 'Anon', version: 0 };
+  updateProfileUI(); upsertProfile(profile).catch(()=>{});
+
+  var currentChannel = { id: 'global', label: '# global' };
+  var dmPeers = {}; var groupsById = {}; var unread = {}; var lastTs = 0; var connecting=false; var lastTypingSent=0;
+  var messageCache = {}; // id -> message (for replies)
+  var replyTo = null;
+  var attachments = []; // [{id,url} — uploaded]
+
+  // Presence ping
+  setInterval(()=>{ fetch('/api/ping',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:uid})}).catch(()=>{}); }, 60000);
+  setTimeout(()=>{ fetch('/api/ping',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:uid})}).catch(()=>{}); }, 1000);
+
+  // Events
+  globalItem.addEventListener('click', ()=> setChannel('global','# global'));
+  newDmBtn.addEventListener('click', promptNewDM);
+  newGroupBtn.addEventListener('click', promptNewGroup);
+  joinGroupBtn.addEventListener('click', promptJoinGroup);
+
+  sendBtn.addEventListener('click', trySendMessage);
+  inputEl.addEventListener('keydown', function(e){
+    if (e.key==='Enter' && !e.shiftKey){ e.preventDefault(); trySendMessage(); }
+    maybeSendTyping();
+  });
+  inputEl.addEventListener('input', maybeSendTyping);
+  refreshBtn.addEventListener('click', ()=> loadHistory(currentChannel.id));
+  clearBtn.addEventListener('click', onClearGlobal);
+  clearDmBtn.addEventListener('click', onClearDM);
+  clearGroupBtn.addEventListener('click', onClearGroup);
+  leaveGroupBtn.addEventListener('click', onLeaveGroup);
+  pinsBtn.addEventListener('click', togglePins);
+  pinsClose.addEventListener('click', togglePins);
+  replyCancel.addEventListener('click', clearReply);
+
+  attachBtn.addEventListener('click', ()=> attachInput.click());
+  attachInput.addEventListener('change', async (e)=>{
+    var files = Array.from(e.target.files||[]);
+    for (var f of files){ await addAttachmentFile(f); }
+    attachInput.value = '';
+  });
+
+  gidChip.addEventListener('click', async ()=>{
+    var gid = gidChip.dataset.gid || ''; if (!gid) return;
+    try { await navigator.clipboard.writeText(gid); gidChip.textContent = gid + ' ✓'; setTimeout(()=>{ gidChip.textContent = gid; }, 1200); } catch {}
+  });
+
+  openSettingsBtn.addEventListener('click', ()=> showModal(true));
+  cancelSettingsBtn.addEventListener('click', ()=> showModal(false));
+  saveSettingsBtn.addEventListener('click', onSaveSettings);
+  copyIdBtn.addEventListener('click', ()=> navigator.clipboard.writeText(uid).then(()=>alert('User ID copied')) );
+  $('#avatarFile').addEventListener('change', onAvatarFile);
+
+  messagesEl.addEventListener('click', onMessagesClick);
+  messagesEl.addEventListener('paste', onPasteImage);
+  messagesEl.addEventListener('dragover', e=>{ e.preventDefault(); });
+  messagesEl.addEventListener('drop', onDropImage);
+  inputEl.addEventListener('paste', onPasteImage);
+  inputEl.addEventListener('dragover', e=>{ e.preventDefault(); });
+  inputEl.addEventListener('drop', onDropImage);
+
+  if (!localStorage.getItem('cc_profile')) showModal(true);
+
+  // Init
+  loadHistory('global').then(()=>{ attachStream(); setInterval(()=>{ pollForNew(); }, 5000); });
+  refreshDmList();
+  refreshGroupList();
+  updateHeaderButtons();
+  updatePresenceLoop();
+
+  // ---------- Helpers: profile/prefs ----------
+  function getOrMakeId(){ var id=localStorage.getItem('cc_uid'); if (!id){ id = (crypto&&crypto.randomUUID)?crypto.randomUUID():(Date.now()+'-'+Math.random().toString(36).slice(2,8)); localStorage.setItem('cc_uid', id); } return id; }
+  function loadProfileLocal(){ try{ var raw=localStorage.getItem('cc_profile'); return raw?JSON.parse(raw):null; }catch(e){ return null; } }
+  function saveProfileLocal(p){ localStorage.setItem('cc_profile', JSON.stringify(p)); }
+  function loadPrefs(){ try{ var raw=localStorage.getItem('cc_prefs'); return raw?JSON.parse(raw):null; }catch(e){ return null; } }
+  function savePrefs(p){ localStorage.setItem('cc_prefs', JSON.stringify(p)); }
+  function applyPrefsToUI(){
+    prefAutoOpen.checked=!!prefs.autoOpenDM; prefTyping.checked=!!prefs.typing; prefPing.checked=!!prefs.ping;
+    prefsSummary.textContent = (prefs.autoOpenDM?'Auto-open DMs':'Manual DMs')+', '+(prefs.typing?'Typing on':'Typing off')+', '+(prefs.ping?'Ping on':'Ping off');
+  }
+  function updateProfileUI(){
+    meName.textContent = profile.username || 'Anon';
+    usernameEl.value = profile.username || '';
+    avatarPrev.innerHTML=''; avatarSmall.innerHTML='';
+    if (profile.version){
+      var src='/api/avatar/'+encodeURIComponent(uid)+(profile.version?('?v='+profile.version):'');
+      var i1=new Image(); i1.src=src; var i2=new Image(); i2.src=src;
+      avatarPrev.appendChild(i1); avatarSmall.appendChild(i2);
+    } else {
+      avatarPrev.textContent = initials(profile.username||'Anon');
+      avatarSmall.textContent = initials(profile.username||'Anon');
+    }
+  }
+  function initials(name){ var s=(name||'A').trim(); var bits=s.split(/\\s+/).filter(Boolean); var i1=(bits[0]&&bits[0][0])||'A'; var i2=(bits[1]&&bits[1][0])||''; return (i1+i2).toUpperCase(); }
+  async function onAvatarFile(){ var f=this.files&&this.files[0]; if(!f)return; var dataUrl=await imageToDataURL(f,128); profile.avatarData=dataUrl; profile.version=(profile.version||0)+1; updateProfileUI(); }
+  async function onSaveSettings(){
+    profile.username = (usernameEl.value||'').trim().slice(0,40)||'Anon';
+    var res = await upsertProfile(profile); if (res&&res.ok&&res.profile) profile.version=res.profile.version||profile.version;
+    saveProfileLocal({ userId:uid, username:profile.username, version:profile.version });
+    prefs.autoOpenDM=!!prefAutoOpen.checked; prefs.typing=!!prefTyping.checked; prefs.ping=!!prefPing.checked; savePrefs(prefs); applyPrefsToUI();
+    updateProfileUI(); showModal(false);
+  }
+  function showModal(s){ modalBack.style.display = s?'flex':'none'; }
+  async function upsertProfile(p){
+    var body={ userId:uid, username:p.username }; if (p.avatarData) body.avatarData=p.avatarData;
+    var r=await fetch('/api/profile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); try{ return await r.json(); }catch{ return {ok:false}; }
+  }
+
+  // ---------- Channels / DMs / Groups ----------
+  function dmChannelId(a,b){ var arr=[String(a||''),String(b||'')].sort(); return 'dm:'+arr[0]+':'+arr[1]; }
+  function isDm(ch){ return ch.startsWith('dm:'); }
+  function isGrp(ch){ return ch.startsWith('grp:'); }
+  function groupChannelId(id){ return 'grp:'+String(id||''); }
+  function peerFromChannel(ch){ if(!isDm(ch))return null; var p=ch.split(':'), a=p[1], b=p[2]; return (a===uid)?b:(b===uid? a : null); }
+
+  async function refreshDmList(){
+    try{
+      var r=await fetch('/api/dmlist?user='+encodeURIComponent(uid)); var j=await r.json();
+      if (j.ok && Array.isArray(j.peers)){ dmPeers={}; j.peers.forEach(p=> dmPeers[p.userId]=p); renderDmList(); }
+    }catch{}
+  }
+  function renderDmList(){
+    dmListEl.innerHTML=''; var keys=Object.keys(dmPeers); if(!keys.length){ var h=document.createElement('div'); h.className='hint'; h.style.padding='0 12px 8px'; h.textContent='No DMs yet.'; dmListEl.appendChild(h); return; }
+    keys.forEach(pid=>{
+      var p=dmPeers[pid]; var item=document.createElement('div'); item.className='chan-item'; item.dataset.peerId=pid;
+      var av=document.createElement('div'); av.className='avatar';
+      if (p.version){ var img=new Image(); img.src='/api/avatar/'+encodeURIComponent(pid)+(p.version?('?v='+p.version):''); img.alt='avatar'; av.appendChild(img); }
+      else av.textContent = initials(p.username||'Anon');
+      var dot=document.createElement('div'); dot.className='presence'; av.appendChild(dot);
+
+      var label=document.createElement('div'); label.style.minWidth='0'; label.style.overflow='hidden'; label.style.textOverflow='ellipsis'; label.textContent='@ '+(p.username||'Anon');
+      var badge=document.createElement('span'); badge.className='badge'; badge.style.display='none'; badge.textContent='0'; badge.id='badge-dm-'+pid;
+
+      item.appendChild(av); item.appendChild(label); item.appendChild(badge);
+      item.addEventListener('click', ()=>{ var ch=dmChannelId(uid,pid); setChannel(ch,'@ '+(p.username||'Anon')); });
+      dmListEl.appendChild(item);
+    });
+    markActiveInList(); updateBadges(); updatePresenceLoop();
+  }
+
+  async function refreshGroupList(){
+    try{
+      var r=await fetch('/api/grouplist?user='+encodeURIComponent(uid)); var j=await r.json();
+      if (j.ok && Array.isArray(j.groups)){
+        groupsById={}; j.groups.forEach(g=> groupsById[g.id]=g);
+        renderGroupList();
+      }
+    }catch{}
+  }
+  function renderGroupList(){
+    grpListEl.innerHTML='';
+    var keys = Object.keys(groupsById);
+    if (!keys.length){ var h=document.createElement('div'); h.className='hint'; h.style.padding='0 12px 8px'; h.textContent='No groups yet.'; grpListEl.appendChild(h); return; }
+    keys.forEach(gid=>{
+      var g=groupsById[gid];
+      var item=document.createElement('div'); item.className='chan-item'; item.dataset.groupId=gid; item.title='ID: '+gid+' • Owner: '+(g.ownerId===uid?'You':g.ownerId);
+      var av=document.createElement('div'); av.className='avatar'; av.textContent='#';
+
+      var labelWrap=document.createElement('div'); labelWrap.style.minWidth='0';
+      var nameLine=document.createElement('div'); nameLine.style.overflow='hidden'; nameLine.style.textOverflow='ellipsis'; nameLine.textContent='# '+(g.name||('group-'+gid.slice(-4)));
+      var idLine=document.createElement('div'); idLine.className='hint mono'; idLine.textContent=gid;
+
+      var badge=document.createElement('span'); badge.className='badge'; badge.style.display='none'; badge.textContent='0'; badge.id='badge-grp-'+gid;
+
+      labelWrap.appendChild(nameLine); labelWrap.appendChild(idLine);
+      item.appendChild(av); item.appendChild(labelWrap); item.appendChild(badge);
+      item.addEventListener('click', ()=>{ setChannel(groupChannelId(gid), '# '+(g.name||('group-'+gid.slice(-4)))); });
+      grpListEl.appendChild(item);
+    });
+    markActiveInList(); updateBadges();
+  }
+
+  function markActiveInList(){
+    document.querySelectorAll('.chan-item').forEach(el=> el.classList.remove('active'));
+    if (currentChannel.id==='global'){ globalItem.classList.add('active'); return; }
+    if (isDm(currentChannel.id)){
+      var peer = peerFromChannel(currentChannel.id);
+      if (peer){ var el = dmListEl.querySelector('.chan-item[data-peer-id="'+peer+'"]'); if (el) el.classList.add('active'); }
+      return;
+    }
+    if (isGrp(currentChannel.id)){
+      var gid = currentChannel.id.split(':')[1];
+      var el = grpListEl.querySelector('.chan-item[data-group-id="'+gid+'"]');
+      if (el) el.classList.add('active');
+    }
+  }
+
+  async function startDM(peerId){
+    if(!peerId || peerId===uid) return;
+    if (!dmPeers[peerId]){
+      try{ var r=await fetch('/api/profile/'+encodeURIComponent(peerId)); var j=await r.json();
+        dmPeers[peerId]={ userId:peerId, username:j?.profile?.username||'Anon', version:j?.profile?.version||0 };
+      }catch{ dmPeers[peerId]={ userId:peerId, username:'Anon', version:0 }; }
+      renderDmList();
+    }
+    var ch = dmChannelId(uid, peerId);
+    setChannel(ch, '@ ' + (dmPeers[peerId]?.username||'Anon'));
+  }
+  function promptNewDM(){ var id=prompt('Enter the user ID to DM (they see it in their sidebar):'); if(!id) return; startDM(String(id).trim()); }
+
+  async function promptNewGroup(){
+    var name = prompt('Group name (max 40 chars):'); if(!name) return;
+    name = name.trim().slice(0,40); if (!name) return;
+    try{
+      var r=await fetch('/api/group/create',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ userId: uid, name })});
+      var j=await r.json(); if (!j.ok) return alert(j.error||'Failed to create group');
+      groupsById[j.group.id]=j.group; renderGroupList();
+      setChannel(groupChannelId(j.group.id), '# '+j.group.name);
+      alert('Group created! Share the ID to invite others: '+j.group.id);
+    }catch(e){ alert('Failed to create group'); }
+  }
+  async function promptJoinGroup(){
+    var gid = prompt('Enter Group ID to join:'); if(!gid) return;
+    gid = gid.trim();
+    try{
+      var r=await fetch('/api/group/join',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ userId: uid, groupId: gid })});
+      var j=await r.json(); if (!j.ok) return alert(j.error||'Failed to join');
+      groupsById[j.group.id]=j.group; renderGroupList();
+      setChannel(groupChannelId(j.group.id), '# '+(j.group.name||('group-'+j.group.id.slice(-4))));
+    }catch(e){ alert('Failed to join group'); }
+  }
+
+  async function setChannel(id, label){
+    currentChannel={ id, label };
+    gidChip.style.display = 'none'; gidChip.dataset.gid=''; gidChip.textContent='';
+    if (isGrp(id)){
+      var gid=id.split(':')[1];
+      if (!groupsById[gid]){ try{ var r=await fetch('/api/group/info?groupId='+encodeURIComponent(gid)); var j=await r.json(); if(j.ok) groupsById[gid]=j.group; }catch{} }
+      var g = groupsById[gid];
+      var name = g?.name || ('group-'+gid.slice(-4));
+      chanTitle.textContent = '# '+name;
+      inputEl.placeholder = 'Message #'+name;
+      // Show group ID chip (click to copy)
+      gidChip.style.display = 'inline-block';
+      gidChip.dataset.gid = gid;
+      gidChip.textContent = gid;
+    } else if (isDm(id)) {
+      chanTitle.textContent = label;
+      inputEl.placeholder = 'Message '+label;
+    } else {
+      chanTitle.textContent = '# global';
+      inputEl.placeholder = 'Message #global';
+    }
+    messagesEl.innerHTML=''; lastTs=0; unread[id]=0; updateBadges(); markActiveInList(); updateHeaderButtons(); loadHistory(id); closePins();
+    clearReply(); // reset reply on channel switch
+  }
+  function updateHeaderButtons(){
+    var isdm=isDm(currentChannel.id), isgrp=isGrp(currentChannel.id);
+    clearDmBtn.style.display = isdm ? 'inline-block' : 'none';
+    clearGroupBtn.style.display = isgrp ? 'inline-block' : 'none';
+    leaveGroupBtn.style.display = isgrp ? 'inline-block' : 'none';
+    clearBtn.style.display = (!isdm && !isgrp) ? 'inline-block' : 'none';
+    if (isgrp){
+      var gid=currentChannel.id.split(':')[1], g=groupsById[gid];
+      pinsLabel.textContent = '# '+(g?.name || ('group-'+gid.slice(-4)))+' ('+gid+')';
+      var owner = g && g.ownerId === uid;
+      clearGroupBtn.disabled = !owner;
+      clearGroupBtn.title = owner ? 'Clear messages in this group (owner only)' : 'Only the group owner can clear';
+    } else {
+      pinsLabel.textContent = isdm?currentChannel.label : '# global';
+    }
+  }
+
+  // ---------- Messaging ----------
+  async function loadHistory(ch){
+    try{
+      var r=await fetch('/api/history?channel='+encodeURIComponent(ch)+'&limit=200&since=0',{cache:'no-store'});
+      var j=await r.json(); messagesEl.innerHTML=''; messageCache={};
+      if (Array.isArray(j.messages)){
+        for (var i=0;i<j.messages.length;i++){ var m=j.messages[i]; messageCache[m.id]=m; if (m.channel===currentChannel.id) appendMessage(m); }
+        if (j.messages.length) lastTs=j.messages[j.messages.length-1].ts;
+        scrollToBottom();
+        // fetch reactions in batch
+        var ids=j.messages.map(m=>m.id); if (ids.length){ var rr=await fetch('/api/reactions?channel='+encodeURIComponent(ch)+'&ids='+encodeURIComponent(ids.join(','))); var rj=await rr.json(); if (rj.ok){ applyReactions(rj.reactions); } }
+      }
+    }catch{}
+  }
+  function applyReactions(map){
+    Object.keys(map||{}).forEach(id=>{
+      var sums=map[id]; var row=document.querySelector('.msg[data-id="'+id+'"] .reactions'); if (!row) return;
+      Object.keys(sums).forEach(e=> upsertReactionPill(row, e, sums[e], false));
+    });
+  }
+  async function pollForNew(){
+    try{
+      var r=await fetch('/api/history?channel='+encodeURIComponent(currentChannel.id)+'&since='+lastTs+'&limit=200',{cache:'no-store'});
+      var j=await r.json();
+      if (Array.isArray(j.messages) && j.messages.length){
+        for (var i=0;i<j.messages.length;i++){ var m=j.messages[i]; messageCache[m.id]=m; if (m.channel===currentChannel.id) appendMessage(m); }
+        lastTs=j.messages[j.messages.length-1].ts; scrollToBottom();
+      }
+    }catch{}
+  }
+  function attachStream(){
+    if (connecting) return; connecting=true;
+    var es=new EventSource('/api/stream');
+
+    es.addEventListener('message', ev=>{
+      try{
+        var d=JSON.parse(ev.data); if (!d||!d.channel||!d.message) return;
+        var ch=d.channel, m=d.message; messageCache[m.id]=m;
+        // ensure DM peer visible
+        if (ch.startsWith('dm:')){ var peer=peerFromChannel(ch); if (peer && peer!==uid && !dmPeers[peer]) { refreshDmList(); } }
+        // Auto-open incoming DMs
+        if (ch.startsWith('dm:')){
+          var parts=ch.split(':'), a=parts[1], b=parts[2];
+          var amParticipant=(uid===a||uid===b); var incomingToMe = amParticipant && m.userId!==uid;
+          if (incomingToMe && prefs.autoOpenDM && currentChannel.id!==ch){
+            var other=(uid===a)?b:a; var label='@ '+((dmPeers[other]&&dmPeers[other].username)||'Anon'); setChannel(ch,label);
+          }
+        }
+        // Render or unread
+        if (ch===currentChannel.id){ appendMessage(m); lastTs=Math.max(lastTs, m.ts||0); scrollToBottom(); }
+        else { unread[ch]=(unread[ch]||0)+1; if (prefs.ping && ch.startsWith('dm:')) tryPing(); updateBadges(); }
+      }catch{}
+    });
+    es.addEventListener('typing', ev=>{
+      try{ var d=JSON.parse(ev.data); if (!prefs.typing) return; if (d.channel!==currentChannel.id) return; if (d.userId===uid) return; showTyping(d.username||'Someone'); }catch{}
+    });
+    es.addEventListener('reaction', ev=>{
+      try{ var d=JSON.parse(ev.data); if (d.channel!==currentChannel.id) return;
+        var row=document.querySelector('.msg[data-id="'+d.id+'"] .reactions'); if (row){ row.innerHTML=''; Object.keys(d.summary||{}).forEach(e=> upsertReactionPill(row,e,d.summary[e], false)); }
+      }catch{}
+    });
+    es.addEventListener('edit', ev=>{
+      try{ var d=JSON.parse(ev.data); if (d.channel!==currentChannel.id) return; var m=d.message; var wrap=document.querySelector('.msg[data-id="'+m.id+'"]'); if (!wrap) return;
+        var content=wrap.querySelector('.content'); content.innerHTML = renderContent(m.content||''); var meta=wrap.querySelector('.meta'); if (m.edited){ var tag=document.createElement('span'); tag.className='time'; tag.textContent='(edited)'; meta.appendChild(tag); }
+      }catch{}
+    });
+    es.addEventListener('delete', ev=>{
+      try{ var d=JSON.parse(ev.data); if (d.channel!==currentChannel.id) return; var wrap=document.querySelector('.msg[data-id="'+d.id+'"]'); if (wrap) wrap.remove(); }catch{}
+    });
+    es.addEventListener('pin', ev=>{
+      try{ var d=JSON.parse(ev.data); if (d.channel!==currentChannel.id) return; if (pinsPanel.style.display==='block') refreshPins(); }catch{}
+    });
+    es.addEventListener('cleared-channel', ev=>{
+      try{ var d=JSON.parse(ev.data); if (d.channel===currentChannel.id){ messagesEl.innerHTML=''; lastTs=0; } unread[d.channel]=0; updateBadges(); }catch{}
+    });
+    es.addEventListener('error', ()=>{ es.close(); connecting=false; setTimeout(attachStream, 2000); });
+  }
+
+  function showTyping(name){ typingEl.style.display='inline'; typingEl.textContent=(name||'Someone')+' is typing…'; clearTimeout(showTyping._t); showTyping._t=setTimeout(()=> typingEl.style.display='none', 2000); }
+  function maybeSendTyping(){ var now=Date.now(); if (!prefs.typing) return; if (now-lastTypingSent<1500) return; lastTypingSent=now; fetch('/api/typing',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:uid, channel:currentChannel.id})}).catch(()=>{}); }
+  function tryPing(){ try{ var C=window.AudioContext||window.webkitAudioContext; var ctx=new C(); var o=ctx.createOscillator(), g=ctx.createGain(); o.type='sine'; o.frequency.setValueAtTime(880, ctx.currentTime); g.gain.setValueAtTime(0.0001, ctx.currentTime); o.connect(g); g.connect(ctx.destination); o.start(); g.gain.exponentialRampToValueAtTime(0.1, ctx.currentTime+0.005); g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime+0.12); o.stop(ctx.currentTime+0.15); }catch{} }
+
+  // ---------- Send / Slash / Reply ----------
+  async function trySendMessage(){
+    var raw=inputEl.value, txt=raw.trim(); if (!txt && attachments.length===0) return;
+
+    // Slash commands
+    if (txt.startsWith('/')){
+      if (txt.startsWith('/nick ')){ var name=txt.slice(6).trim().slice(0,40); if (!name) return; profile.username=name; await upsertProfile(profile); saveProfileLocal({userId:uid, username:profile.username, version:profile.version}); updateProfileUI(); inputEl.value=''; return; }
+      if (txt.startsWith('/dm ')){ var rest=txt.slice(4).trim(); var sp=rest.indexOf(' '); if (sp>0){ var pid=rest.slice(0,sp).trim(), msg=rest.slice(sp+1).trim(); if (pid&&msg){ await ensurePeer(pid); var ch=dmChannelId(uid,pid); await sendMessage(ch,msg); setChannel(ch,'@ '+(dmPeers[pid]?.username||'Anon')); inputEl.value=''; return; } } }
+      if (txt.startsWith('/me ')){ var act=txt.slice(4).trim(); if (act){ await sendMessage(currentChannel.id, '* '+profile.username+' '+act+' *'); inputEl.value=''; return; } }
+      // fallthrough to normal send
+    }
+
+    await sendMessage(currentChannel.id, txt, replyTo, attachments.length?attachments.map(a=>a.url):undefined);
+    inputEl.value=''; clearReply(); clearAttachments();
+  }
+  async function ensurePeer(pid){
+    if (dmPeers[pid]) return;
+    try{ var r=await fetch('/api/profile/'+encodeURIComponent(pid)); var j=await r.json(); dmPeers[pid]={userId:pid, username:j?.profile?.username||'Anon', version:j?.profile?.version||0}; }catch{ dmPeers[pid]={userId:pid, username:'Anon', version:0}; }
+    renderDmList();
+  }
+  async function sendMessage(channel, text, replyToId, atts){
+    sendBtn.disabled=true;
+    try{
+      var payload={ userId:uid, content:text, channel };
+      if (replyToId) payload.replyTo = replyToId;
+      if (atts && atts.length) payload.attachments = atts.slice(0,3);
+      var r=await fetch('/api/message',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)}); var j=await r.json();
+      if (!j.ok) alert(j.error||'Failed to send');
+    }catch(e){ console.error(e); }
+    finally{ sendBtn.disabled=false; }
+  }
+
+  // ---------- Rendering ----------
+  function scrollToBottom(){ messagesEl.scrollTop = messagesEl.scrollHeight + 9999; }
+  function formatTime(ts){ try{ var d=new Date(ts); return d.toLocaleString([], { hour:'2-digit', minute:'2-digit', month:'short', day:'numeric' }); }catch(e){ return ''; } }
+
+  // BACKTICK-SAFE MARKDOWN RENDERER
+  function renderContent(txt){
+    var s = String(txt||'').replace(/[&<>\"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]); });
+    var bt = '\\u0060';
+    try {
+      var triple = new RegExp(bt+bt+bt+'([\\s\\S]*?)'+bt+bt+bt, 'g');
+      s = s.replace(triple, function(_m, code){
+        return '<pre style="background:#1b1d22;border:1px solid var(--border);padding:8px;border-radius:8px;overflow:auto;"><code>'
+             + code
+             + '</code></pre>';
+      });
+      var inline = new RegExp(bt+'([^'+bt+']{1,200})'+bt, 'g');
+      s = s.replace(inline, '<code style="background:#1b1d22;border:1px solid var(--border);padding:2px 4px;border-radius:4px;">$1</code>');
+    } catch(e) {}
+    s = s.replace(/\\*\\*([^*]{1,200})\\*\\*/g, '<strong>$1</strong>');
+    s = s.replace(/\\*([^*]{1,200})\\*/g, '<em>$1</em>');
+    var urlRe = /(https?:\\/\\/[^\\s]+)|(^|\\s)(www\\.[^\\s]+)/gi;
+    s = s.replace(urlRe, function(m, g1, g2){
+      var u = g1 || (g2 ? ('http://' + g2.trim()) : null);
+      if (!u) return m;
+      var safe = u;
+      return '<a href="' + safe + '" target="_blank" rel="noreferrer noopener">' + safe + '</a>';
+    });
+    s = s.replace(/(^|\\s)@([a-z0-9_\\-]{1,32})/gi, '$1<span style="color:var(--yellow); font-weight:700;">@$2</span>');
+    s = s.replace(/(^|\\n)&gt;\\s?(.+?)(?=\\n|$)/g,
+      '$1<blockquote style="border-left:3px solid var(--border);margin:6px 0;padding-left:8px;color:var(--muted)">$2</blockquote>');
+    return s;
+  }
+
+  async function addLinkPreviewIfAny(container, text){
+    var m = String(text||'').match(/https?:\\/\\/[^\\s]+/i);
+    if (!m) return;
+    try{
+      var r=await fetch('/api/og?u='+encodeURIComponent(m[0])); var j=await r.json();
+      var has = j && j.ok && (j.title||j.description||j.image);
+      if (!has) return;
+      var wrap=document.createElement('div'); wrap.className='preview';
+      if (j.image){
+        wrap.innerHTML='<div class="row"><img alt="preview" src="'+escapeHtml(j.image)+'"><div class="ph"><div style="font-weight:700">'+escapeHtml(j.title||m[0])+'</div><div>'+escapeHtml(j.description||'')+'</div></div></div>';
+      } else {
+        wrap.innerHTML='<div class="ph"><div style="font-weight:700">'+escapeHtml(j.title||m[0])+'</div><div>'+escapeHtml(j.description||'')+'</div></div>';
+      }
+      container.appendChild(wrap);
+    }catch{}
+  }
+
+  function appendMessage(m){
+    if (m.deleted) return;
+    var wrap=document.createElement('div'); wrap.className='msg'; wrap.dataset.id=m.id;
+
+    var av=document.createElement('div'); av.className='avatar';
+    if (m.avatarUrl){ var img=new Image(); img.src=m.avatarUrl; img.alt='avatar'; av.appendChild(img); }
+    else { av.textContent=initials(m.username||'Anon'); }
+
+    var inner=document.createElement('div');
+
+    var meta=document.createElement('div'); meta.className='meta';
+    var name=document.createElement('div'); name.className='name'; name.textContent=m.username||'Anon';
+    if (m.userId && m.userId!==uid){ name.classList.add('dmable'); name.dataset.uid=m.userId; name.title='Message @'+(m.username||'Anon'); }
+    var time=document.createElement('time'); time.className='time'; time.textContent=formatTime(m.ts||Date.now());
+    meta.appendChild(name); meta.appendChild(time);
+    if (m.edited){ var tag=document.createElement('span'); tag.className='time'; tag.textContent='(edited)'; meta.appendChild(tag); }
+
+    var bubble=document.createElement('div'); bubble.className='bubble';
+
+    if (m.replyTo && messageCache[m.replyTo]){
+      var rm = messageCache[m.replyTo];
+      var rep=document.createElement('div'); rep.className='reply';
+      rep.innerHTML = '<strong>'+escapeHtml(rm.username||'Anon')+':</strong> '+escapeHtml((rm.content||'').slice(0,120));
+      bubble.appendChild(rep);
+    }
+
+    var content=document.createElement('div'); content.className='content'; content.innerHTML=renderContent(m.content||'');
+    bubble.appendChild(meta); bubble.appendChild(content);
+
+    if (Array.isArray(m.attachments) && m.attachments.length){
+      var att=document.createElement('div'); att.className='attach';
+      m.attachments.forEach(u=>{ var im=new Image(); im.src=u; im.alt='attachment'; att.appendChild(im); });
+      bubble.appendChild(att);
+    }
+
+    addLinkPreviewIfAny(bubble, m.content||'');
+
+    var actions=document.createElement('div'); actions.className='actions';
+    var replyBtn=mkAction('Reply', ()=> startReply(m));
+    var reactBtn=mkAction('React', ()=> openPicker(wrap));
+    actions.appendChild(replyBtn); actions.appendChild(reactBtn);
+    if (m.userId===uid){
+      actions.appendChild(mkAction('Edit', ()=> startEdit(wrap, m)));
+      actions.appendChild(mkAction('Delete', ()=> doDelete(m)));
+    }
+    actions.appendChild(mkAction('Pin', ()=> doPin(m, 'add')));
+    bubble.appendChild(actions);
+
+    var reacts=document.createElement('div'); reacts.className='reactions';
+    var add=document.createElement('button'); add.className='react-add'; add.textContent='+ Add reaction'; add.addEventListener('click', ()=> openPicker(wrap)); reacts.appendChild(add);
+
+    inner.appendChild(bubble); inner.appendChild(reacts);
+    wrap.appendChild(av); wrap.appendChild(inner);
+    messagesEl.appendChild(wrap);
+  }
+
+  function mkAction(label, fn){ var b=document.createElement('button'); b.className='action'; b.textContent=label; b.addEventListener('click', fn); return b; }
+  function startReply(m){ replyTo = m.id; replyName.textContent = m.username||'Anon'; replySnippet.textContent = (m.content||'').slice(0,80); replyWrap.style.display='block'; }
+  function clearReply(){ replyTo=null; replyWrap.style.display='none'; }
+
+  // Reactions UI
+  function openPicker(msgWrap){
+    var picker = document.createElement('div');
+    picker.style.position='absolute'; picker.style.zIndex='10'; picker.style.background='#1b1d22'; picker.style.border='1px solid var(--border)'; picker.style.borderRadius='10px'; picker.style.padding='8px';
+    var emojis = ['👍','❤️','😂','😮','😢','👀','🔥','🎉'];
+    emojis.forEach(e=>{ var btn=document.createElement('button'); btn.className='action'; btn.textContent=e; btn.style.fontSize='16px'; btn.addEventListener('click',()=>{ reactToggle(msgWrap.dataset.id, e); picker.remove(); }); picker.appendChild(btn); });
+    msgWrap.appendChild(picker);
+    setTimeout(()=> document.addEventListener('click', function once(){ picker.remove(); document.removeEventListener('click', once); }, {once:true}), 0);
+  }
+  async function reactToggle(id, emoji){
+    var row=document.querySelector('.msg[data-id="'+id+'"] .reactions'); if (!row) return;
+    var mine=false, pill=row.querySelector('.react[data-emoji="'+emoji+'"].mine'); if (pill) mine=true;
+    var op = mine ? 'remove' : 'add';
+    await fetch('/api/react',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:uid, channel:currentChannel.id, id, emoji, op})});
+    var count = pill ? (parseInt(pill.dataset.count||'1',10)-1) : 0;
+    if (op==='add') upsertReactionPill(row, emoji, (pill?count:0)+1, true);
+    else if (pill){ var newc=(count); if (newc<=0) pill.remove(); else { pill.dataset.count=String(newc); pill.innerHTML=emoji+' '+newc; pill.classList.remove('mine'); } }
+  }
+  function upsertReactionPill(row, emoji, count, isMine){
+    var pill = row.querySelector('.react[data-emoji="'+emoji+'"]');
+    if (!pill){
+      pill=document.createElement('button'); pill.className='react'; pill.dataset.emoji=emoji; pill.dataset.count=String(count);
+      pill.innerHTML=emoji+' '+count; row.insertBefore(pill, row.firstChild);
+      pill.addEventListener('click', ()=> reactToggle(row.closest('.msg').dataset.id, emoji));
+    } else {
+      pill.dataset.count=String(count); pill.innerHTML=emoji+' '+count;
+    }
+    if (isMine) pill.classList.add('mine');
+  }
+
+  // Edit/Delete/Pin
+  function startEdit(wrap, m){
+    var content = wrap.querySelector('.content');
+    var orig = m.content||'';
+    var ta = document.createElement('textarea'); ta.value=orig; ta.style.width='100%'; ta.style.height='90px';
+    content.replaceWith(ta);
+    var save = mkAction('Save', async ()=>{
+      var txt=ta.value.trim(); var r=await fetch('/api/edit-message',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:uid, channel:currentChannel.id, id:m.id, content:txt})});
+      var j=await r.json(); if (!j.ok) alert(j.error||'Failed to edit');
+      else { var div=document.createElement('div'); div.className='content'; div.innerHTML=renderContent(txt); ta.replaceWith(div); }
+      save.remove(); cancel.remove();
+    });
+    var cancel = mkAction('Cancel', ()=>{ var div=document.createElement('div'); div.className='content'; div.innerHTML=renderContent(orig); ta.replaceWith(div); save.remove(); cancel.remove(); });
+    wrap.querySelector('.actions').appendChild(save); wrap.querySelector('.actions').appendChild(cancel);
+  }
+  async function doDelete(m){
+    if (!confirm('Delete this message?')) return;
+    var r=await fetch('/api/delete-message',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:uid, channel:currentChannel.id, id:m.id})});
+    var j=await r.json(); if (!j.ok) alert(j.error||'Failed to delete');
+  }
+  async function doPin(m, op){
+    var r=await fetch('/api/pin',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:uid, channel:currentChannel.id, id:m.id, op})});
+    var j=await r.json(); if (!j.ok) alert(j.error||'Failed to pin');
+    else if (pinsPanel.style.display==='block') refreshPins();
+  }
+
+  // Clear buttons
+  async function onClearGlobal(){
+    var a=prompt('Type "CLEAR" to remove ALL messages in #global.'); if(!a||a.toUpperCase()!=='CLEAR') return;
+    clearBtn.disabled=true;
+    try{
+      var token=localStorage.getItem('cc_admin_token')||''; var headers={'content-type':'application/json'}; if (token) headers['X-Admin']=token;
+      var r=await fetch('/api/clear',{method:'POST',headers,body: token?JSON.stringify({token}):'{}'}); var j=await r.json(); if(!j.ok) alert(j.error||'Failed to clear');
+      if (currentChannel.id==='global'){ messagesEl.innerHTML=''; lastTs=0; } unread['global']=0; updateBadges();
+    }catch(e){ console.error(e); alert('Failed to clear');
+    } finally { clearBtn.disabled=false; }
+  }
+  async function onClearDM(){
+    if (!isDm(currentChannel.id)) return;
+    var a=prompt('Type "CLEAR DM" to remove all messages in this private thread (both sides).'); if(!a||a.toUpperCase()!=='CLEAR DM') return;
+    clearDmBtn.disabled=true;
+    try{
+      var r=await fetch('/api/clear-channel',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:uid, channel:currentChannel.id})});
+      var j=await r.json(); if (!j.ok) alert(j.error||'Failed to clear DM');
+      messagesEl.innerHTML=''; lastTs=0; unread[currentChannel.id]=0; updateBadges();
+    }catch(e){ console.error(e); alert('Failed to clear DM'); }
+    finally{ clearDmBtn.disabled=false; }
+  }
+  async function onClearGroup(){
+    if (!isGrp(currentChannel.id)) return;
+    var a=prompt('Type "CLEAR GROUP" to remove all messages in this group (owner only).'); if(!a||a.toUpperCase()!=='CLEAR GROUP') return;
+    clearGroupBtn.disabled=true;
+    try{
+      var gid=currentChannel.id.split(':')[1];
+      var token=localStorage.getItem('cc_admin_token')||'';
+      var body={ userId:uid, groupId:gid }; if (token) body.token=token;
+      var r=await fetch('/api/clear-group',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+      var j=await r.json(); if (!j.ok) alert(j.error||'Failed to clear group');
+      messagesEl.innerHTML=''; lastTs=0; unread[currentChannel.id]=0; updateBadges();
+    }catch(e){ console.error(e); alert('Failed to clear group'); }
+    finally{ clearGroupBtn.disabled=false; }
+  }
+  async function onLeaveGroup(){
+    if (!isGrp(currentChannel.id)) return;
+    if (!confirm('Leave this group? You can rejoin later if you have the Group ID.')) return;
+    leaveGroupBtn.disabled=true;
+    try{
+      var gid=currentChannel.id.split(':')[1];
+      var r=await fetch('/api/group/leave',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ userId:uid, groupId:gid })});
+      var j=await r.json(); if (!j.ok) alert(j.error||'Failed to leave');
+      delete groupsById[gid]; renderGroupList();
+      setChannel('global','# global');
+    }catch(e){ console.error(e); alert('Failed to leave'); }
+    finally{ leaveGroupBtn.disabled=false; }
+  }
+
+  // Unread badges
+  function updateBadges(){
+    var ug=unread['global']||0; badgeGlobal.style.display=ug?'inline-block':'none'; badgeGlobal.textContent=ug;
+    Object.keys(dmPeers).forEach(pid=>{
+      var ch=dmChannelId(uid,pid); var badge=document.getElementById('badge-dm-'+pid); if (!badge) return;
+      var u=unread[ch]||0; badge.style.display=u?'inline-block':'none'; badge.textContent=u;
+    });
+    Object.keys(groupsById).forEach(gid=>{
+      var ch=groupChannelId(gid); var badge=document.getElementById('badge-grp-'+gid); if (!badge) return;
+      var u=unread[ch]||0; badge.style.display=u?'inline-block':'none'; badge.textContent=u;
+    });
+  }
+
+  // Click handling inside messages
+  function onMessagesClick(ev){
+    var t=ev.target;
+    if (t.classList.contains('name') && t.dataset.uid && t.dataset.uid!==uid){ startDM(t.dataset.uid); }
+  }
+
+  // Pins panel
+  async function togglePins(){
+    if (pinsPanel.style.display==='block') return closePins();
+    await refreshPins(); pinsPanel.style.display='block';
+  }
+  async function refreshPins(){
+    pinsList.innerHTML=''; var r=await fetch('/api/pins?channel='+encodeURIComponent(currentChannel.id)); var j=await r.json();
+    if (!j.ok) { pinsList.innerHTML='<div class="hint">Failed to load pins</div>'; return; }
+    if (!j.pins || !j.pins.length){ pinsList.innerHTML='<div class="hint">No pinned messages</div>'; return; }
+    j.pins.forEach(id=>{
+      var m=messageCache[id]; if (!m) return; var d=document.createElement('div'); d.className='pin-item';
+      d.innerHTML = '<div style="font-weight:700">'+escapeHtml(m.username||'Anon')+' <span class="hint">'+escapeHtml(new Date(m.ts).toLocaleString())+'</span></div>'+
+                    '<div>'+renderContent((m.content||'').slice(0,240))+'</div>'+
+                    '<div style="margin-top:6px;display:flex;gap:6px;"><button class="btn" data-jump="'+id+'">Jump</button><button class="btn ghost" data-unpin="'+id+'">Unpin</button></div>';
+      pinsList.appendChild(d);
+    });
+    pinsList.querySelectorAll('[data-jump]').forEach(btn=> btn.addEventListener('click', ()=> jumpTo(btn.dataset.jump)));
+    pinsList.querySelectorAll('[data-unpin]').forEach(btn=> btn.addEventListener('click', ()=> unpin(btn.dataset.unpin)));
+  }
+  function closePins(){ pinsPanel.style.display='none'; }
+  function jumpTo(id){
+    closePins();
+    var el=document.querySelector('.msg[data-id="'+id+'"]');
+    if (el){ el.scrollIntoView({behavior:'smooth', block:'center'}); el.style.outline='2px solid var(--accent)'; setTimeout(()=> el.style.outline='none', 1200); }
+  }
+  async function unpin(id){
+    var m=messageCache[id]; if (!m) return;
+    await doPin(m, 'remove'); refreshPins();
+  }
+
+  // Presence polling
+  function updatePresenceLoop(){
+    var ids=Object.keys(dmPeers); if (!ids.length) { setTimeout(updatePresenceLoop, 10000); meDot.style.background='#23a55a'; return; }
+    fetch('/api/presence?ids='+encodeURIComponent(ids.join(','))).then(r=>r.json()).then(j=>{
+      if (j.ok && j.presence){
+        ids.forEach(pid=>{
+          var el = dmListEl.querySelector('.chan-item[data-peer-id="'+pid+'"] .presence');
+          if (el) el.style.background = j.presence[pid] ? '#23a55a' : '#555';
+        });
+      }
+      meDot.style.background = '#23a55a'; // optimistic for me
+    }).catch(()=>{}).finally(()=> setTimeout(updatePresenceLoop, 12000));
+  }
+
+  // Attachments (paste/drag small images)
+  async function onPasteImage(e){
+    var it = (e.clipboardData && e.clipboardData.items) || []; for (var i=0;i<it.length;i++){
+      var itx=it[i]; if (itx.kind==='file'){ var f=itx.getAsFile(); await addAttachmentFile(f); }
+    }a
+  }
+  async function onDropImage(e){ e.preventDefault(); var files=e.dataTransfer && e.dataTransfer.files; if (!files || !files.length) return; for (var i=0;i<files.length;i++) await addAttachmentFile(files[i]); }
+  async function addAttachmentFile(f){ if (!f || !f.type.startsWith('image/')) return;
+    var dataUrl=await imageToDataURL(f, 1024);
+    var r=await fetch('/api/upload',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ userId:uid, dataUrl })});
+    var j=await r.json(); if (!j.ok) { alert(j.error||'Failed to attach'); return; }
+    attachments.push({ id:j.id, url:j.url }); renderAttachments();
+  }
+  function renderAttachments(){ attachbar.innerHTML=''; attachments.forEach((a,idx)=>{ var chip=document.createElement('div'); chip.className='attchip'; chip.innerHTML='<span>📎 Image '+(idx+1)+'</span> <span class="x">✕</span>'; chip.querySelector('.x').addEventListener('click',()=>{ attachments.splice(idx,1); renderAttachments(); }); attachbar.appendChild(chip); }); }
+  function clearAttachments(){ attachments=[]; renderAttachments(); }
+
+  // Generic utils
+  function escapeHtml(s){ return String(s).replace(/[&<>\"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  async function imageToDataURL(file, maxSide){
+    var bitmap=await createImageBitmap(file);
+    var w=maxSide, h=maxSide; var canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h; var ctx=canvas.getContext('2d');
+    var ratio=Math.max(w/bitmap.width, h/bitmap.height); var nw=Math.round(bitmap.width*ratio), nh=Math.round(bitmap.height*ratio); var nx=Math.round((w-nw)/2), ny=Math.round((h-nh)/2);
+    ctx.fillStyle='#222'; ctx.fillRect(0,0,w,h); ctx.imageSmoothingQuality='high'; ctx.drawImage(bitmap, nx, ny, nw, nh);
+    return canvas.toDataURL('image/webp', 0.9);
+  }
+})();
+</script>
+</body>
+</html>`;
+}
